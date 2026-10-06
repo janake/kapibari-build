@@ -1,0 +1,203 @@
+name: Build native images
+
+# KAP-773 (tulajdonosi döntés, 2026-10-06): a janake/kapibari backend és gateway
+# GraalVM natív image-e ITT fordul, mert a privát repo GitHub-hosted runnere
+# (2 vCPU / 7 GB) a backend natív fordításánál OOM-ol (~8 GB heap kell), a
+# nyilvános repo standard runnere viszont 4 vCPU / 16 GB és ingyenes.
+#
+# Ebben a repóban NINCS forráskód: a workflow a privát repót a megadott SHA-n
+# checkoutolja (SOURCE_READ_TOKEN: fine-grained, csak janake/kapibari
+# Contents: read), natívan fordít, a privát ci.yml-lel azonos Dockerfile-ból
+# image-et épít, és a saját GITHUB_TOKEN-nel a GHCR-be tolja:
+#   ghcr.io/janake/kapibari-build/kapibari-backend:<sha>
+#   ghcr.io/janake/kapibari-build/kapibari-gateway:<sha>
+# A csomagok PRIVÁTAK maradnak: org.opencontainers.image.source label
+# szándékosan NINCS (az a nyilvános repóhoz kötné/láthatóvá tenné).
+#
+# Indítás KIZÁRÓLAG workflow_dispatch (a privát CI a BUILD_DISPATCH_TOKEN-nel
+# hívja, a run-name alapján találja meg és várja ki a futást). Soha nincs
+# pull_request / pull_request_target trigger. Tesztek itt NEM futnak — a privát
+# CI már lefuttatta őket a natív build előtt.
+#
+# A nyilvános repo futási logjai NYILVÁNOSAK: a Maven/native-image kimenet ezért
+# fájlba megy, a logba csak a vége kerül (hibánál hosszabb részlet). Artifact
+# feltöltés nincs.
+run-name: native ${{ inputs.component }} ${{ inputs.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: A janake/kapibari commit teljes (40 karakteres, kisbetűs hex) SHA-ja
+        required: true
+        type: string
+      component:
+        description: Melyik natív image épüljön
+        required: true
+        type: choice
+        options:
+          - backend
+          - gateway
+          - both
+        default: both
+      push:
+        description: Image push a GHCR-be (false = csak fordítás, pl. nem-main próbafuttatás)
+        required: false
+        type: boolean
+        default: true
+      latest:
+        description: A ':latest' tag is erre az image-re mutasson (a privát CI csak main-pushnál kéri)
+        required: false
+        type: boolean
+        default: false
+
+# Legszűkebb default; packages: write csak a build jobon.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+    steps:
+      - name: Validate sha and component
+        id: check
+        env:
+          SHA: ${{ inputs.sha }}
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Érvénytelen sha (40 karakteres kisbetűs hex kell)."
+            exit 1
+          fi
+          case "${COMPONENT}" in
+            backend) matrix='["backend"]' ;;
+            gateway) matrix='["gateway"]' ;;
+            both)    matrix='["backend","gateway"]' ;;
+            *) echo "::error::Érvénytelen component: ${COMPONENT}"; exit 1 ;;
+          esac
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Native ${{ matrix.component }}
+    needs: validate
+    # Nyilvános repo: a standard ubuntu-latest 4 vCPU / 16 GB RAM.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    env:
+      SRC_DIR: src
+    steps:
+      - name: Runner resources
+        run: |
+          nproc
+          free -h
+          df -h /
+
+      # A privát forrás checkoutja a megadott SHA-n. persist-credentials: false —
+      # a token nem marad a .git/config-ban a további lépésekhez.
+      - name: Checkout janake/kapibari
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: janake/kapibari
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          path: ${{ env.SRC_DIR }}
+          persist-credentials: false
+
+      # KAP-649 (Boot 4): a native-maven-plugin 1.1.1 reachability-metadata
+      # sémája GraalVM 25-öt igényel — a privát ci.yml-lel azonos beállítás.
+      - name: Set up GraalVM Community 25
+        uses: graalvm/setup-graalvm@0426e2e191540e8514dff98dc52a5f5146a2a276 # v1
+        with:
+          java-version: '25'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache: 'maven'
+
+      - name: Install native image prerequisites
+        run: |
+          test -f /usr/include/zlib.h || (sudo apt-get update && sudo apt-get install -y zlib1g-dev)
+
+      # A privát ci.yml natív opciói (-H:+IncludeAllTimeZones, placeholder env),
+      # de -Ob NÉLKÜL: 16 GB RAM mellett a teljes -O2 optimalizálás belefér.
+      # Hangolás kódmódosítás nélkül (repo-variable-ök ebben a repóban):
+      #   NATIVE_BACKEND_XMX (12g), NATIVE_BACKEND_PARALLELISM (4), NATIVE_BACKEND_OPTS (üres)
+      #   NATIVE_GATEWAY_XMX (8g),  NATIVE_GATEWAY_PARALLELISM (4), NATIVE_GATEWAY_OPTS (üres)
+      # A DB_PASSWORD placeholdert a gateway nem használja (ártalmatlan).
+      - name: Compile native image
+        working-directory: ${{ env.SRC_DIR }}/kapibari-${{ matrix.component }}
+        env:
+          NATIVE_IMAGE_OPTIONS: >-
+            ${{ matrix.component == 'backend'
+              && format('-J-Xmx{0} {1} --parallelism={2} -H:+IncludeAllTimeZones', vars.NATIVE_BACKEND_XMX || '12g', vars.NATIVE_BACKEND_OPTS || '', vars.NATIVE_BACKEND_PARALLELISM || '4')
+              || format('-J-Xmx{0} {1} --parallelism={2} -H:+IncludeAllTimeZones', vars.NATIVE_GATEWAY_XMX || '8g', vars.NATIVE_GATEWAY_OPTS || '', vars.NATIVE_GATEWAY_PARALLELISM || '4') }}
+          DB_PASSWORD: ci-placeholder
+          KEYCLOAK_ISSUER_URI: https://kc.prodet.org/realms/kapibari
+          BUILD_LOG: ${{ runner.temp }}/native-build.log
+        run: |
+          set -uo pipefail
+          echo "NATIVE_IMAGE_OPTIONS=${NATIVE_IMAGE_OPTIONS}"
+          # Nyilvános log: a teljes kimenet fájlba megy, csak a vége látszik.
+          if mvn -B -ntp -Pnative native:compile -DskipTests > "${BUILD_LOG}" 2>&1; then
+            tail -n 30 "${BUILD_LOG}"
+          else
+            rc=$?
+            echo "::error::A natív fordítás elbukott (exit ${rc}) — a log vége:"
+            tail -n 200 "${BUILD_LOG}"
+            free -h || true
+            exit "${rc}"
+          fi
+          ls -lh "target/kapibari-${{ matrix.component }}"
+
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/kapibari-${{ matrix.component }}
+          SHA: ${{ inputs.sha }}
+          LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${SHA}"
+            if [ "${LATEST}" = "true" ]; then echo "${IMAGE}:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver: docker
+
+      - name: Log in to GHCR
+        if: inputs.push
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Ugyanaz a context/Dockerfile, mint a privát ci.yml-ben (kapibari-<component>/).
+      # Szándékosan nincs labels: / org.opencontainers.image.source — a csomag privát marad.
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ env.SRC_DIR }}/kapibari-${{ matrix.component }}
+          push: ${{ inputs.push }}
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Remove private source checkout
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE:?}/${SRC_DIR}"
